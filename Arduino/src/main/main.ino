@@ -1,12 +1,15 @@
+// LedBridge_Fast.ino
 #include <FastLED.h>
 
-#define LED_PIN     6
-#define LED_TYPE    WS2812B
-#define COLOR_ORDER GRB        // if colors look swapped, try RGB
-#define NUM_LEDS    147
-#define BRIGHTNESS  50
+#define LED_PIN       6
+#define LED_TYPE      WS2812B
+#define COLOR_ORDER   GRB       // change to RGB if colors look off
+#define NUM_LEDS      147
+#define BRIGHTNESS    30
+#define BAUD          2000000   // try 2000000 once stable
 
 CRGB leds[NUM_LEDS];
+static uint8_t frameBuf[NUM_LEDS * 3];
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
@@ -15,46 +18,51 @@ void setup() {
 
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);
+  FastLED.setDither(0);
   FastLED.clear(true);
 
-  Serial.begin(1000000);
-  while (!Serial) {}
+  Serial.begin(BAUD);
+  // Optional banner then silence (don’t print during streaming)
   Serial.println("READY");
 }
 
-void showPixel(int index, uint8_t r, uint8_t g, uint8_t b) {
-  FastLED.clear();
-  if (index >= 0 && index < NUM_LEDS) {
-    leds[index] = CRGB(r, g, b);
+bool readExact(uint8_t* dst, size_t n, uint32_t timeout_ms) {
+  size_t got = 0;
+  uint32_t t0 = millis();
+  while (got < n) {
+    int c = Serial.read();
+    if (c >= 0) {
+      dst[got++] = (uint8_t)c;
+    } else {
+      if ((millis() - t0) > timeout_ms) return false;
+      // tiny wait lets USB buffer refill
+      delayMicroseconds(100);
+    }
   }
-  FastLED.show();
+  return true;
 }
 
 void loop() {
-  if (!Serial.available()) return;
+  // Seek header 0xAA 0x55
+  int a = Serial.read();
+  if (a < 0) return;
+  if ((uint8_t)a != 0xAA) return;
+  int b = Serial.read();
+  if (b < 0 || (uint8_t)b != 0x55) return;
 
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-
-  if (line.startsWith("BLUE")) {
-    int n = line.substring(4).toInt();
-    n = constrain(n, 0, NUM_LEDS);
-    fill_solid(leds, NUM_LEDS, CRGB::Black);
-    for (int i = 0; i < n; ++i) leds[i] = CRGB::Blue;
-    FastLED.show();
-    Serial.println("OK");
-  } else if (line.startsWith("PIX")) {
-    // format: PIX <index> <r> <g> <b>
-    int i, r, g, b;
-    if (sscanf(line.c_str(), "PIX %d %d %d %d", &i, &r, &g, &b) == 4) {
-      i = constrain(i, 0, NUM_LEDS - 1);
-      r = constrain(r, 0, 255);
-      g = constrain(g, 0, 255);
-      b = constrain(b, 0, 255);
-      showPixel(i, (uint8_t)r, (uint8_t)g, (uint8_t)b);
-      Serial.println("OK");
-    } else {
-      Serial.println("ERR");
-    }
+  // Read payload
+  const size_t need = NUM_LEDS * 3;
+  if (!readExact(frameBuf, need, 20)) {
+    // flush junk and resync fast
+    while (Serial.read() >= 0) {}
+    return;
   }
+
+  // Copy GRB bytes into FastLED buffer
+  for (int i = 0, j = 0; i < NUM_LEDS; ++i, j += 3) {
+    leds[i].g = frameBuf[j + 0];
+    leds[i].r = frameBuf[j + 1];
+    leds[i].b = frameBuf[j + 2];
+  }
+  FastLED.show();
 }
