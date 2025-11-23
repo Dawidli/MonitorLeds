@@ -18,7 +18,6 @@ except ImportError:
 
 
 # ========= LED / LAYOUT CONFIG =========
-# LED counts per edge (must match your physical strip)
 TOP_LEDS    = 51
 RIGHT_LEDS  = 22
 BOTTOM_LEDS = 51
@@ -26,13 +25,12 @@ LEFT_LEDS   = 23
 
 NUM_LEDS = TOP_LEDS + RIGHT_LEDS + BOTTOM_LEDS + LEFT_LEDS
 
-# Height in pixels for top/bottom capture strips
-TOP_BOTTOM_STRIP_HEIGHT = 40
+TOP_BOTTOM_STRIP_HEIGHT = 40   # height of top/bottom capture strips in pixels
 # ======================================
 
 
 # ========= SERIAL CONFIG =========
-COM_PORT   = "COM3"      # change if your Arduino appears on another port
+COM_PORT   = "COM3"      # adjust if your Arduino is on a different port
 BAUD       = 2_000_000   # must match Serial.begin() on Arduino
 START_BYTE = 255         # simple start-of-frame marker
 # ================================
@@ -48,8 +46,8 @@ GAMMA            = 2.0    # gamma correction on brightness
 
 # Warm / cool tint:
 #   0.0 = neutral
-#   +0.5 = noticeably warmer (more red, less blue)
-#   -0.5 = noticeably cooler (more blue, less red)
+#   +0.5 = warmer (more red, less blue)
+#   -0.5 = cooler (more blue, less red)
 WARM_COOL        = 0.0
 # ===========================================
 
@@ -57,8 +55,14 @@ WARM_COOL        = 0.0
 # ========= PILLARBOX / YOUTUBE MODE =========
 # When True, we assume 16:9 content centered on a wider screen (e.g. 21:9),
 # and ignore the side black bars by sampling only inside the active 16:9 area.
-PILLARBOX_MODE = False
+PILLARBOX_MODE = True
 # ===========================================
+
+
+# ========= STARTUP FADE-IN =========
+# Time (seconds) to fade from 0 → 100% brightness when the script starts
+FADE_IN_DURATION = 2.0
+# ===================================
 
 
 @contextlib.contextmanager
@@ -135,7 +139,7 @@ def serial_worker(
     Using a separate thread decouples USB timing from the capture loop.
     """
     if ser is None:
-        # If no serial is available, just wait for stop signal and ignore frames.
+        # If no serial, just drain queue and stop when asked.
         while not stop_evt.is_set():
             try:
                 item = q.get(timeout=0.1)
@@ -161,7 +165,7 @@ def serial_worker(
                 ser.write(frame)
             except Exception as e:
                 print(f"Serial write error: {e}")
-                # We keep going; worst case LEDs freeze on last frame
+                # Keep running; worst case LEDs freeze on last frame
     finally:
         if ser is not None and ser.is_open:
             ser.close()
@@ -176,7 +180,6 @@ def apply_color_correction(led_float: np.ndarray) -> np.ndarray:
     Output:
         (NUM_LEDS, 3) uint8 array, values in [0, 255]
     """
-    # Normalize to 0..1
     arr = np.clip(led_float, 0, 255).astype(np.float32) / 255.0
     out = np.empty_like(arr)
 
@@ -200,18 +203,15 @@ def apply_color_correction(led_float: np.ndarray) -> np.ndarray:
 
         r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
 
-        # Warm/cool tint in RGB space:
-        # Positive WARM_COOL -> more red / less blue (warmer)
-        # Negative WARM_COOL -> more blue / less red (cooler)
+        # Warm/cool tint in RGB space
         if WARM_COOL != 0.0:
             k = 0.15 * WARM_COOL  # strength of tint
             r2 = float(np.clip(r2 + k, 0.0, 1.0))
             b2 = float(np.clip(b2 - k, 0.0, 1.0))
-            # We leave G unchanged to keep things natural
+            # G left unchanged for natural look
 
         out[i] = (r2, g2, b2)
 
-    # Back to 0..255 uint8
     return (out * 255.0).astype(np.uint8)
 
 
@@ -220,10 +220,10 @@ def main():
     with suppress_stderr():
         camera = dxcam.create(output_color="RGB")
 
-    # Start the capture thread inside dxcam:
+    # Start the capture thread inside dxcam
     camera.start(target_fps=120, video_mode=True)
 
-    # Set up serial + background worker
+    # Serial + background worker
     ser = open_serial()
     serial_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=1)
     stop_evt = threading.Event()
@@ -242,11 +242,14 @@ def main():
     # Pillarbox offset in pixels (computed after first frame)
     pillar_pixels = 0
 
-    # Buffers reused every frame to avoid re-allocations
+    # Buffers reused every frame
     led_float          = np.zeros((NUM_LEDS, 3), dtype=np.float32)
     smoothed_led_float = np.zeros((NUM_LEDS, 3), dtype=np.float32)
     have_smoothed      = False
     led_colors         = np.zeros((NUM_LEDS, 3), dtype=np.uint8)
+
+    # For startup fade-in
+    start_time = time.perf_counter()
 
     try:
         while True:
@@ -254,16 +257,14 @@ def main():
             if frame is None:
                 continue
 
-            # On first valid frame, detect screen geometry and compute pillarbox offset
+            # First valid frame → get geometry and pillarbox
             if not slices_ready:
                 h, w, _ = frame.shape
                 screen_w, screen_h = w, h
 
                 if PILLARBOX_MODE:
-                    # Assume 16:9 content centered, full screen height
                     active_width_16_9 = int(screen_h * 16 / 9)
                     if active_width_16_9 < screen_w:
-                        # Side bar width in pixels
                         pillar_pixels = (screen_w - active_width_16_9) // 2
                     else:
                         pillar_pixels = 0
@@ -280,62 +281,50 @@ def main():
 
             # --- Compute horizontal active region (for pillarbox mode) ---
             if pillar_pixels > 0:
-                # Active 16:9 area horizontally
                 active_left  = pillar_pixels
                 active_right = screen_w - pillar_pixels
                 active_width = active_right - active_left
             else:
-                # No pillarbox: active area is entire width
                 active_left  = 0
                 active_right = screen_w
                 active_width = screen_w
 
-            # --- Slice top & bottom strips using active horizontal area ---
+            # --- Slice top & bottom strips in active area ---
             top_img    = frame[0:strip_h, active_left:active_right, :]
             bottom_img = frame[screen_h - strip_h:screen_h, active_left:active_right, :]
 
-            # --- Side strips ---
-            # Side strip width is based on active width, not full screen width.
+            # --- Side strips based on active width ---
             top_region_width = active_width / TOP_LEDS
             side_w = int(top_region_width)
             if side_w <= 0:
                 side_w = 1
 
-            # Ensure we have room for side_w on each side
             if active_width < 2 * side_w:
-                # Fallback: use very narrow side strips
                 side_w = max(1, active_width // 4)
 
-            # Left and right strip x ranges within the active area
             left_x_start  = active_left
             left_x_end    = left_x_start + side_w
             right_x_end   = active_right
             right_x_start = right_x_end - side_w
 
-            # Clamp ranges to screen bounds (safety)
             left_x_start  = max(0, left_x_start)
             left_x_end    = min(screen_w, left_x_end)
             right_x_start = max(0, right_x_start)
             right_x_end   = min(screen_w, right_x_end)
 
-            # Vertical range for side strips (skip top/bottom strip height)
             v_top    = strip_h
             v_bottom = screen_h - strip_h
 
-            left_img = frame[v_top:v_bottom, left_x_start:left_x_end, :]
+            left_img  = frame[v_top:v_bottom, left_x_start:left_x_end, :]
             right_img = frame[v_top:v_bottom, right_x_start:right_x_end, :]
 
-            # --- Compute average color per region (float32 RGB) ---
+            # --- Compute average color per region ---
             top_means    = regions_top_bottom_vec(top_img, TOP_LEDS)
             bottom_means = regions_top_bottom_vec(bottom_img, BOTTOM_LEDS)
             right_means  = regions_left_right_vec(right_img, RIGHT_LEDS)
             left_means   = regions_left_right_vec(left_img, LEFT_LEDS)
 
-            # --- Stack LEDs in physical order (clockwise around screen) ---
-            # 1) Top:    left -> right
-            # 2) Right:  top -> bottom
-            # 3) Bottom: right -> left (reversed)
-            # 4) Left:   bottom -> top (reversed)
+            # --- Stack LEDs in physical order (clockwise) ---
             idx = 0
             led_float[idx:idx + TOP_LEDS] = top_means
             idx += TOP_LEDS
@@ -358,37 +347,49 @@ def main():
                     + (1.0 - SMOOTHING_ALPHA) * led_float
                 )
 
-            # --- Apply color correction, gamma, warm/cool etc. ---
+            # --- Color correction: brightness, gamma, saturation, warm/cool ---
             led_colors[:] = apply_color_correction(smoothed_led_float)
 
+            # --- Startup fade-in: scale brightness from 0 → 1 over FADE_IN_DURATION ---
+            elapsed = time.perf_counter() - start_time
+            if elapsed < FADE_IN_DURATION:
+                # simple smooth curve: ease-in (slow at start, then faster)
+                t = elapsed / FADE_IN_DURATION
+                fade_factor = t * t  # quadratic ease
+            else:
+                fade_factor = 1.0
+
+            if fade_factor < 1.0:
+                to_send = (led_colors.astype(np.float32) * fade_factor).astype(np.uint8)
+            else:
+                to_send = led_colors
+
             # --- Queue frame for serial worker ---
-            # If LEDs are completely black, skip sending to avoid tiny black blips.
-            if np.any(led_colors):
+            if np.any(to_send):
                 try:
-                    # Queue size is 1; if worker is busy, drop this frame
-                    serial_queue.put_nowait(led_colors.copy())
+                    serial_queue.put_nowait(to_send.copy())
                 except queue.Full:
                     pass
 
-
     except KeyboardInterrupt:
         print("\nStopped by user.")
-
     finally:
-        # Stop capture
+        # Stop capture and clean up
         camera.stop()
-        # Optionally send a single all-black frame (Arduino will fade from last colors anyway)
+
+        # Optional: send a single all-black frame (Arduino will also fade out on idle)
         try:
             off_frame = np.zeros((NUM_LEDS, 3), dtype=np.uint8)
             serial_queue.put(off_frame, timeout=0.1)
         except queue.Full:
             pass
-        # Tell worker to exit
+
         stop_evt.set()
         try:
-            serial_queue.put_nowait(None)  # sentinel value
+            serial_queue.put_nowait(None)  # sentinel for worker
         except queue.Full:
             pass
+
         worker.join(timeout=1.0)
 
 
