@@ -1,10 +1,10 @@
+import time
 import sys
 import io
 import contextlib
 import threading
 import queue
 from typing import Optional
-import time
 
 import numpy as np
 import serial
@@ -41,9 +41,9 @@ START_BYTE = 255         # simple start-of-frame marker
 # ========= COLOR / SMOOTHING TUNING =========
 BRIGHTNESS       = 0.9    # overall brightness scale (0.0–1.0)
 SATURATION_BOOST = 1.6    # >1.0 = more saturated colors
-MIN_VISIBLE      = 5     # below this (0–255) → treat as black/off
+MIN_VISIBLE      = 10     # below this (0–255) → treat as black/off
 
-SMOOTHING_ALPHA  = 0.4    # temporal smoothing (0..1): higher = smoother/slower
+SMOOTHING_ALPHA  = 0.6    # temporal smoothing (0..1): higher = smoother/slower
 GAMMA            = 2.0    # gamma correction on brightness
 
 # Warm / cool tint:
@@ -76,8 +76,8 @@ def regions_top_bottom_vec(strip_img: np.ndarray, num_regions: int) -> np.ndarra
     """
     Compute average color per region for a horizontal strip (top or bottom).
 
-    We split width into `num_regions` equal regions and return an array:
-        shape (num_regions, 3), dtype float32, RGB in 0..255
+    strip_img: (H, W, 3)
+    Returns: (num_regions, 3), float32, RGB in 0..255
     """
     h, w, _ = strip_img.shape
     region_w = w // num_regions          # integer width per region
@@ -95,8 +95,8 @@ def regions_left_right_vec(strip_img: np.ndarray, num_regions: int) -> np.ndarra
     """
     Compute average color per region for a vertical strip (left or right).
 
-    We split height into `num_regions` equal regions and return an array:
-        shape (num_regions, 3), dtype float32, RGB in 0..255
+    strip_img: (H, W, 3)
+    Returns: (num_regions, 3), float32, RGB in 0..255
     """
     h, w, _ = strip_img.shape
     region_h = h // num_regions
@@ -370,31 +370,25 @@ def main():
                 except queue.Full:
                     pass
 
+
     except KeyboardInterrupt:
         print("\nStopped by user.")
+
     finally:
         # Stop capture
         camera.stop()
-
-        # --- Send one final all-black frame before shutting down LEDs ---
+        # Optionally send a single all-black frame (Arduino will fade from last colors anyway)
         try:
-            off_frame = np.zeros((NUM_LEDS, 3), dtype=np.uint8)  # all LEDs off
-            serial_queue.put_nowait(off_frame)
+            off_frame = np.zeros((NUM_LEDS, 3), dtype=np.uint8)
+            serial_queue.put(off_frame, timeout=0.1)
         except queue.Full:
-            # If queue is full, just skip — LEDs will stay on last frame,
-            # but worker usually drains fast enough that this won't happen.
             pass
-
-        # Allow a tiny moment for the worker to send it
-        time.sleep(0.02)
-
-        # --- Tell worker to shut down ---
+        # Tell worker to exit
         stop_evt.set()
         try:
-            serial_queue.put_nowait(None)  # sentinel for shutdown
+            serial_queue.put_nowait(None)  # sentinel value
         except queue.Full:
             pass
-
         worker.join(timeout=1.0)
 
 
