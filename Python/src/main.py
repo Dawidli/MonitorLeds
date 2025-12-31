@@ -37,18 +37,18 @@ START_BYTE = 255         # simple start-of-frame marker
 
 
 # ========= COLOR / SMOOTHING TUNING =========
-BRIGHTNESS       = 1.5    # overall brightness scale (0.0–1.0)
-SATURATION_BOOST = 2.0     # >1.0 = more saturated colors
-MIN_VISIBLE      = 10     # below this (0–255) → treat as black/off
+BRIGHTNESS       = 1.0    # overall brightness scale (0.0–1.0)
+SATURATION_BOOST = 0.9    # >1.0 = more saturated colors
+MIN_VISIBLE      = 10 # below this (0–255) → treat as black/off
 
-SMOOTHING_ALPHA  = 0.9    # temporal smoothing (0..1): higher = smoother/slower
-GAMMA            = 1.0    # gamma correction on brightness
+SMOOTHING_ALPHA  = 0.9   # temporal smoothing (0..1): higher = smoother/slower
+GAMMA            = 1.2    # gamma correction on brightness
 
 # Warm / cool tint:
 #   0.0 = neutral
 #   +0.5 = warmer (more red, less blue)
 #   -0.5 = cooler (more blue, less red)
-WARM_COOL        = 0.5
+WARM_COOL        = 0.0
 # ===========================================
 
 
