@@ -2,103 +2,125 @@
 
 #define NUM_LEDS 147
 #define DATA_PIN 6
-#define MAX_BRIGHTNESS 100   // or whatever you like
+#define MAX_BRIGHTNESS 100
 
 CRGB leds[NUM_LEDS];
 
-const uint8_t START_BYTE = 255;
-const uint32_t FRAME_SIZE = NUM_LEDS * 3;  // R,G,B per LED
+// --- Serial protocol ---
+static const uint32_t BAUD = 2000000;
+static const uint8_t HEADER[4] = {0xAA, 0x55, 0xAA, 0x55};  // magic sync
+static const uint16_t FRAME_SIZE = NUM_LEDS * 3;            // RGB bytes
 
-// Idle / fade-out behaviour
-const unsigned long IDLE_START_MS   = 1000;  // after this with no frame, start fading
-const unsigned long FADE_INTERVAL_MS = 40;  // ms between fade steps
-const uint8_t FADE_AMOUNT           = 20;   // how much to fade per step (0-255)
+// Optional: disable idle fade while debugging (recommended)
+#define ENABLE_IDLE_FADE 0
+
+#if ENABLE_IDLE_FADE
+const unsigned long IDLE_START_MS    = 1000;
+const unsigned long FADE_INTERVAL_MS = 40;
+const uint8_t       FADE_AMOUNT      = 20;
 
 unsigned long lastFrameTime = 0;
 unsigned long lastFadeTime  = 0;
 bool ledsAreOff = true;
 bool fading     = false;
+#endif
+
+// Reads exactly n bytes into buf, returns true if complete within timeout_ms
+bool readExact(uint8_t* buf, uint16_t n, uint16_t timeout_ms) {
+  uint16_t got = 0;
+  unsigned long start = millis();
+  while (got < n && (millis() - start) < timeout_ms) {
+    while (Serial.available() && got < n) {
+      buf[got++] = (uint8_t)Serial.read();
+    }
+  }
+  return (got == n);
+}
+
+// Scan stream until we see HEADER sequence
+bool waitForHeader() {
+  static uint8_t state = 0;
+
+  while (Serial.available()) {
+    uint8_t b = (uint8_t)Serial.read();
+
+    if (state == 0) {
+      state = (b == HEADER[0]) ? 1 : 0;
+    } else if (state == 1) {
+      state = (b == HEADER[1]) ? 2 : (b == HEADER[0] ? 1 : 0);
+    } else if (state == 2) {
+      state = (b == HEADER[2]) ? 3 : (b == HEADER[0] ? 1 : 0);
+    } else { // state == 3
+      if (b == HEADER[3]) {
+        state = 0;
+        return true;
+      } else {
+        state = (b == HEADER[0]) ? 1 : 0;
+      }
+    }
+  }
+  return false;
+}
 
 void setup() {
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(MAX_BRIGHTNESS);
-  FastLED.clear(true);           // start fully off
-  ledsAreOff    = true;
-  lastFrameTime = millis();
+  FastLED.clear(true);
 
-  Serial.begin(2000000);         // must match Python BAUD
+  Serial.begin(BAUD);
+
+#if ENABLE_IDLE_FADE
+  lastFrameTime = millis();
+#endif
 }
 
 void loop() {
-  unsigned long now = millis();
+  // 1) Wait for a full header (robust sync)
+  if (waitForHeader()) {
+    static uint8_t buf[FRAME_SIZE];
 
-  // --- 1) Try to receive a new frame ---
-  if (Serial.available()) {
-    int b = Serial.read();
-    if (b == START_BYTE) {
-      if (readFrame()) {
-        // We got a complete, valid frame → show it
-        FastLED.show();
-        lastFrameTime = now;
-        ledsAreOff = false;
-        fading = false;       // cancel any ongoing fade
+    // 2) Read full payload
+    if (readExact(buf, FRAME_SIZE, 50)) {
+      // 3) Unpack RGB
+      for (int i = 0; i < NUM_LEDS; i++) {
+        uint8_t r = buf[3 * i + 0];
+        uint8_t g = buf[3 * i + 1];
+        uint8_t b = buf[3 * i + 2];
+        leds[i].setRGB(r, g, b);
       }
+      FastLED.show();
+
+#if ENABLE_IDLE_FADE
+      unsigned long now = millis();
+      lastFrameTime = now;
+      ledsAreOff = false;
+      fading = false;
+#endif
     }
   }
 
-  // --- 2) Start fade when we've been idle long enough ---
+#if ENABLE_IDLE_FADE
+  // --- Idle fade (optional) ---
+  unsigned long now = millis();
+
   if (!ledsAreOff && !fading && (now - lastFrameTime > IDLE_START_MS)) {
     fading = true;
     lastFadeTime = now;
   }
 
-  // --- 3) Perform fade steps while idle ---
   if (fading && (now - lastFadeTime > FADE_INTERVAL_MS)) {
     lastFadeTime = now;
-
-    // Fade towards black
     fadeToBlackBy(leds, NUM_LEDS, FADE_AMOUNT);
     FastLED.show();
 
-    // Check if all LEDs are now off
     bool anyOn = false;
     for (int i = 0; i < NUM_LEDS; ++i) {
-      if (leds[i].r || leds[i].g || leds[i].b) {
-        anyOn = true;
-        break;
-      }
+      if (leds[i].r || leds[i].g || leds[i].b) { anyOn = true; break; }
     }
     if (!anyOn) {
       ledsAreOff = true;
       fading = false;
     }
   }
-}
-
-bool readFrame() {
-  static uint8_t buf[FRAME_SIZE];
-  uint32_t got = 0;
-  unsigned long start = millis();
-
-  // Read exactly FRAME_SIZE bytes, with timeout
-  while (got < FRAME_SIZE && (millis() - start) < 50) {
-    if (Serial.available()) {
-      buf[got++] = (uint8_t)Serial.read();
-    }
-  }
-
-  if (got < FRAME_SIZE) {
-    // Incomplete frame: ignore it (do NOT update LEDs)
-    return false;
-  }
-
-  // Unpack RGB into leds[]
-  for (int i = 0; i < NUM_LEDS; ++i) {
-    uint8_t r = buf[3 * i + 0];
-    uint8_t g = buf[3 * i + 1];
-    uint8_t b = buf[3 * i + 2];
-    leds[i].setRGB(r, g, b);
-  }
-
-  return true;
+#endif
 }
