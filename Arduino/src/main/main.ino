@@ -1,31 +1,20 @@
 #include <FastLED.h>
 
-#define NUM_LEDS 147
-#define DATA_PIN 6
-#define MAX_BRIGHTNESS 100
+#define NUM_LEDS        147
+#define DATA_PIN        6
+
+#define MAX_BRIGHTNESS  255      // hard safety cap (0–255)
+#define SWITCH_PIN      2
+#define BRIGHTNESS_PIN  A0       // <-- analog pin (A0/A1/...)
 
 CRGB leds[NUM_LEDS];
 
 // --- Serial protocol ---
 static const uint32_t BAUD = 2000000;
-static const uint8_t HEADER[4] = {0xAA, 0x55, 0xAA, 0x55};  // magic sync
-static const uint16_t FRAME_SIZE = NUM_LEDS * 3;            // RGB bytes
+static const uint8_t  HEADER[4]   = {0xAA, 0x55, 0xAA, 0x55};
+static const uint16_t FRAME_SIZE  = NUM_LEDS * 3;
 
-// Optional: disable idle fade while debugging (recommended)
-#define ENABLE_IDLE_FADE 0
-
-#if ENABLE_IDLE_FADE
-const unsigned long IDLE_START_MS    = 1000;
-const unsigned long FADE_INTERVAL_MS = 40;
-const uint8_t       FADE_AMOUNT      = 20;
-
-unsigned long lastFrameTime = 0;
-unsigned long lastFadeTime  = 0;
-bool ledsAreOff = true;
-bool fading     = false;
-#endif
-
-// Reads exactly n bytes into buf, returns true if complete within timeout_ms
+// ----- helpers -----
 bool readExact(uint8_t* buf, uint16_t n, uint16_t timeout_ms) {
   uint16_t got = 0;
   unsigned long start = millis();
@@ -37,7 +26,6 @@ bool readExact(uint8_t* buf, uint16_t n, uint16_t timeout_ms) {
   return (got == n);
 }
 
-// Scan stream until we see HEADER sequence
 bool waitForHeader() {
   static uint8_t state = 0;
 
@@ -63,25 +51,46 @@ bool waitForHeader() {
 }
 
 void setup() {
-  FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
-  FastLED.setBrightness(MAX_BRIGHTNESS);
-  FastLED.clear(true);
+  pinMode(SWITCH_PIN, INPUT);     // If you want bulletproof: INPUT_PULLUP + wire switch to GND
+  pinMode(BRIGHTNESS_PIN, INPUT);
 
   Serial.begin(BAUD);
 
-#if ENABLE_IDLE_FADE
-  lastFrameTime = millis();
-#endif
+  FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(MAX_BRIGHTNESS);
+  FastLED.clear(true);
 }
 
 void loop() {
-  // 1) Wait for a full header (robust sync)
+  // ---- Read switch ----
+  bool switchOn = (digitalRead(SWITCH_PIN) == HIGH);
+
+  // ---- Read potentiometer and map to 0..MAX_BRIGHTNESS ----
+  int raw = analogRead(BRIGHTNESS_PIN);                 // 0..1023
+  uint8_t potBrightness = map(raw, 0, 1023, 0, MAX_BRIGHTNESS);
+
+  // Optional smoothing (removes jitter). Comment out if you don't want it.
+  static uint16_t smooth = 0;
+  smooth = (smooth * 9 + potBrightness * 1) / 10;       // simple IIR
+  uint8_t brightness = (uint8_t)smooth;
+
+  if (!switchOn) {
+    // OFF: force brightness to 0 and show once
+    FastLED.setBrightness(0);
+    FastLED.show();   // no need to clear; brightness 0 makes it dark
+    // If you prefer true black data on strip, uncomment:
+    // FastLED.clear(true);
+    return;           // skip serial parsing while off
+  }
+
+  // ON: set brightness from potentiometer
+  FastLED.setBrightness(brightness);
+
+  // Receive and display frames when available
   if (waitForHeader()) {
     static uint8_t buf[FRAME_SIZE];
 
-    // 2) Read full payload
     if (readExact(buf, FRAME_SIZE, 50)) {
-      // 3) Unpack RGB
       for (int i = 0; i < NUM_LEDS; i++) {
         uint8_t r = buf[3 * i + 0];
         uint8_t g = buf[3 * i + 1];
@@ -89,38 +98,10 @@ void loop() {
         leds[i].setRGB(r, g, b);
       }
       FastLED.show();
-
-#if ENABLE_IDLE_FADE
-      unsigned long now = millis();
-      lastFrameTime = now;
-      ledsAreOff = false;
-      fading = false;
-#endif
     }
+    // If readExact fails, we ignore the partial frame (no show)
   }
 
-#if ENABLE_IDLE_FADE
-  // --- Idle fade (optional) ---
-  unsigned long now = millis();
-
-  if (!ledsAreOff && !fading && (now - lastFrameTime > IDLE_START_MS)) {
-    fading = true;
-    lastFadeTime = now;
-  }
-
-  if (fading && (now - lastFadeTime > FADE_INTERVAL_MS)) {
-    lastFadeTime = now;
-    fadeToBlackBy(leds, NUM_LEDS, FADE_AMOUNT);
-    FastLED.show();
-
-    bool anyOn = false;
-    for (int i = 0; i < NUM_LEDS; ++i) {
-      if (leds[i].r || leds[i].g || leds[i].b) { anyOn = true; break; }
-    }
-    if (!anyOn) {
-      ledsAreOff = true;
-      fading = false;
-    }
-  }
-#endif
+  // (Optional) small delay to reduce CPU usage (not required)
+  // delay(1);
 }
