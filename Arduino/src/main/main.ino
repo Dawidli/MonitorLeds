@@ -167,6 +167,15 @@ CRGB applyCorrectionsFast(uint8_t r, uint8_t g, uint8_t b) {
   return CRGB(r, g, b);
 }
 
+void showSolidOrange() {
+  // Nice warm orange (tweak if you want)
+  fill_solid(leds, NUM_LEDS, CRGB(255, 80, 0));
+  FastLED.show();
+}
+
+
+
+
 // ---------- UI LED mapping ----------
 int uiLevelForCase(int c) {
   if (c == 0) return map(sat_x100, 0, 200, 0, 200);
@@ -296,6 +305,7 @@ void setup() {
   Serial.begin(BAUD);
 
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setDither(0);
   FastLED.setBrightness(MAX_BRIGHTNESS);
   FastLED.clear(true);
 
@@ -305,6 +315,7 @@ void setup() {
   last_gamma_x100 = gamma_x100;
 
   updateUiLeds();
+  
 }
 
 void loop() {
@@ -402,19 +413,33 @@ void loop() {
   // ---- Switch + pot brightness ----
   bool switchOn = (digitalRead(SWITCH_PIN) == HIGH);
 
-  int raw = analogRead(POT_PIN);
-  uint8_t potBrightness = map(raw, 0, 1023, 0, MAX_BRIGHTNESS);
+  // ---- Pot brightness with deadband ----
+  static uint8_t brightness = MAX_BRIGHTNESS;
+  static uint8_t smooth = MAX_BRIGHTNESS;
 
-  static uint16_t smooth = 0;
-  smooth = (smooth * 9 + potBrightness) / 10;
-  uint8_t brightness = (uint8_t)smooth;
+  int raw = analogRead(POT_PIN);
+  uint8_t target = map(raw, 0, 1023, 0, MAX_BRIGHTNESS);
+
+  // Ignore tiny 1-step changes (ADC noise) to prevent shimmer
+  const uint8_t DEADBAND = 2;
+
+  if (abs((int)target - (int)smooth) >= DEADBAND) {
+    // keep our existing smoothing feel
+    smooth = (uint8_t)((smooth * 9 + target) / 10);
+  }
+
+  brightness = smooth;
+
 
   if (!switchOn) {
-    FastLED.setBrightness(0);
-    FastLED.show();
-    discardIncomingFrames();
+    // Ambient mode: solid orange
+    FastLED.setBrightness(brightness); // still controlled by pot
+    discardIncomingFrames();           // keep serial clean
+    showSolidOrange();
     return;
   }
+
+
 
   FastLED.setBrightness(brightness);
 
