@@ -8,7 +8,6 @@ from typing import Optional
 
 import numpy as np
 import serial
-import colorsys
 
 try:
     import dxcam_cpp as dxcam
@@ -34,19 +33,14 @@ HEADER   = b"\xAA\x55\xAA\x55"
 # ================================
 
 
-# ========= COLOR / SMOOTHING TUNING =========
-BRIGHTNESS       = 1.0
-SATURATION_BOOST = 0.9
-MIN_VISIBLE      = 10
-
-SMOOTHING_ALPHA  = 0.9
-GAMMA            = 1.2
-WARM_COOL        = 0.0
-# ===========================================
+# ========= SMOOTHING TUNING =========
+SMOOTHING_ALPHA = 0.9   # higher = smoother/slower
+# ====================================
 
 
-PILLARBOX_MODE = False
+# ========= STARTUP FADE-IN =========
 FADE_IN_DURATION = 2.0
+# ===================================
 
 
 # ========= PYTHON FADE-OUT =========
@@ -91,8 +85,7 @@ def regions_left_right_vec(strip_img: np.ndarray, num_regions: int) -> np.ndarra
 
 def open_serial() -> Optional[serial.Serial]:
     try:
-        # write_timeout prevents rare “hang on close” situations on some systems
-        ser = serial.Serial(COM_PORT, BAUD, timeout=0, write_timeout=0.2)
+        ser = serial.Serial(COM_PORT, BAUD, timeout=0, write_timeout=0.5)
         return ser
     except Exception as e:
         print(f"Warning: could not open serial port {COM_PORT}: {e}")
@@ -100,10 +93,6 @@ def open_serial() -> Optional[serial.Serial]:
 
 
 def serial_worker(ser: Optional[serial.Serial], q: "queue.Queue[np.ndarray]"):
-    """
-    Worker exits ONLY when it receives sentinel None.
-    This prevents shutdown races where stop_evt kills the worker before it sends black frames.
-    """
     if ser is None:
         while True:
             item = q.get()
@@ -120,7 +109,7 @@ def serial_worker(ser: Optional[serial.Serial], q: "queue.Queue[np.ndarray]"):
             frame = HEADER + led_colors.tobytes()
             try:
                 ser.write(frame)
-                ser.flush()  # ensure it actually leaves the OS buffer
+                #ser.flush()
             except Exception as e:
                 print(f"Serial write error: {e}")
     finally:
@@ -131,40 +120,11 @@ def serial_worker(ser: Optional[serial.Serial], q: "queue.Queue[np.ndarray]"):
             pass
 
 
-def apply_color_correction(led_float: np.ndarray) -> np.ndarray:
-    arr = np.clip(led_float, 0, 255).astype(np.float32) / 255.0
-    out = np.empty_like(arr)
-
-    for i, (r, g, b) in enumerate(arr):
-        h, s, v = colorsys.rgb_to_hsv(r, g, b)
-
-        s = min(1.0, s * SATURATION_BOOST)
-
-        v *= BRIGHTNESS
-        if v > 0.0:
-            v = v ** GAMMA
-
-        if v < MIN_VISIBLE / 255.0:
-            v = 0.0
-
-        r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
-
-        if WARM_COOL != 0.0:
-            k = 0.15 * WARM_COOL
-            r2 = float(np.clip(r2 + k, 0.0, 1.0))
-            b2 = float(np.clip(b2 - k, 0.0, 1.0))
-
-        out[i] = (r2, g2, b2)
-
-    return (out * 255.0).astype(np.uint8)
-
-
 def put_latest(q: "queue.Queue[np.ndarray]", frame: np.ndarray):
-    """
-    Queue latest frame; if full, drop old and replace.
-    This keeps fade smooth even with maxsize=1.
-    """
     try:
+
+
+
         q.put_nowait(frame)
     except queue.Full:
         try:
@@ -202,11 +162,7 @@ def main():
     ser = open_serial()
     serial_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=1)
 
-    worker = threading.Thread(
-        target=serial_worker,
-        args=(ser, serial_queue),
-        daemon=True,
-    )
+    worker = threading.Thread(target=serial_worker, args=(ser, serial_queue), daemon=True)
     worker.start()
 
     screen_w = None
@@ -221,12 +177,10 @@ def main():
 
     start_time = time.perf_counter()
 
-    # Rate limit (USB sanity)
     MAX_SEND_FPS = 60.0
     min_send_dt  = 1.0 / MAX_SEND_FPS
     last_send_t  = 0.0
 
-    # Fade-out state
     last_sent    = np.zeros((NUM_LEDS, 3), dtype=np.uint8)
     black_since  = None
     fade_mode    = False
@@ -242,28 +196,14 @@ def main():
             if not slices_ready:
                 h, w, _ = frame.shape
                 screen_w, screen_h = w, h
-
-                if PILLARBOX_MODE:
-                    active_width_16_9 = int(screen_h * 16 / 9)
-                    pillar_pixels = (screen_w - active_width_16_9) // 2 if active_width_16_9 < screen_w else 0
-                else:
-                    pillar_pixels = 0
-
-                if pillar_pixels * 2 > screen_w:
-                    pillar_pixels = 0
-
+                pillar_pixels = 0
                 slices_ready = True
 
             strip_h = TOP_BOTTOM_STRIP_HEIGHT
 
-            if pillar_pixels > 0:
-                active_left  = pillar_pixels
-                active_right = screen_w - pillar_pixels
-                active_width = active_right - active_left
-            else:
-                active_left  = 0
-                active_right = screen_w
-                active_width = screen_w
+            active_left  = pillar_pixels
+            active_right = screen_w - pillar_pixels
+            active_width = active_right - active_left
 
             top_img    = frame[0:strip_h, active_left:active_right, :]
             bottom_img = frame[screen_h - strip_h:screen_h, active_left:active_right, :]
@@ -309,8 +249,10 @@ def main():
                     + (1.0 - SMOOTHING_ALPHA) * led_float
                 )
 
-            led_colors[:] = apply_color_correction(smoothed_led_float)
+            # Convert to uint8 RGB (no corrections here; Arduino will do it)
+            led_colors[:] = np.clip(smoothed_led_float, 0, 255).astype(np.uint8)
 
+            # Fade-in
             elapsed = time.perf_counter() - start_time
             if elapsed < FADE_IN_DURATION:
                 t = elapsed / FADE_IN_DURATION
@@ -350,8 +292,6 @@ def main():
             else:
                 send_frame = to_send
 
-            # IMPORTANT: keep sending black even after fade (heartbeat),
-            # so any rare corruption gets overwritten quickly.
             if (now_t - last_send_t) >= min_send_dt:
                 last_send_t = now_t
                 last_sent = send_frame.copy()
@@ -362,16 +302,14 @@ def main():
     finally:
         camera.stop()
 
-        # Fade to black on exit, then force multiple black frames
         if FADE_OUT_ENABLED:
             fade_to_black(serial_queue, last_sent, duration_s=FADE_OUT_SECONDS, fps=60.0)
 
         off = np.zeros((NUM_LEDS, 3), dtype=np.uint8)
-        for _ in range(8):                 # send a few times to be extra sure
+        for _ in range(8):
             put_latest(serial_queue, off)
             time.sleep(0.01)
 
-        # Stop worker cleanly AFTER off frames are queued
         serial_queue.put(None)
         worker.join(timeout=2.0)
 
