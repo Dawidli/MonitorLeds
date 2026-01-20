@@ -23,10 +23,10 @@ const int UI_LED4 = 5;   // threshold indicator
 
 CRGB leds[NUM_LEDS];
 
-// --- Serial protocol (frames from Python) ---
+// --- Serial protocol ---
 static const uint32_t BAUD = 2000000;
 static const uint8_t  HEADER[4]  = {0xAA, 0x55, 0xAA, 0x55};
-static const uint16_t FRAME_SIZE = NUM_LEDS * 3;
+static const uint16_t FRAME_SIZE = NUM_LEDS * 3; // expected payload length
 
 // ---------- Threshold parameter ----------
 int enable_thresh_sum = 6;
@@ -35,9 +35,9 @@ const int THRESH_MAX = 60;
 
 // ---------- Button timing ----------
 unsigned long last_case_press_ms = 0;
-const unsigned long CASE_DEBOUNCE_MS = 500; // prevents case skipping
+const unsigned long CASE_DEBOUNCE_MS = 500;
 
-const unsigned long HOLD_MS   = 1000; // your chosen values
+const unsigned long HOLD_MS   = 1000;
 const unsigned long REPEAT_MS = 100;
 
 unsigned long up_press_start_ms   = 0;
@@ -46,7 +46,7 @@ unsigned long down_press_start_ms = 0;
 unsigned long down_last_repeat_ms = 0;
 
 // ----- Factory reset via CASE hold -----
-const unsigned long CASE_RESET_MS = 5000; // 5 seconds
+const unsigned long CASE_RESET_MS = 5000;
 unsigned long case_press_start_ms = 0;
 bool case_reset_done = false;
 
@@ -64,42 +64,7 @@ Config cfg;
 
 bool cfg_dirty = false;
 unsigned long cfg_dirty_since_ms = 0;
-const unsigned long CFG_SAVE_DELAY_MS = 1000; // save 1s after last change
-
-// ---------- Robust frame receiver ----------
-bool readExact(uint8_t* buf, uint16_t n, uint16_t timeout_ms) {
-  uint16_t got = 0;
-  unsigned long start = millis();
-  while (got < n && (millis() - start) < timeout_ms) {
-    while (Serial.available() && got < n) {
-      buf[got++] = (uint8_t)Serial.read();
-    }
-  }
-  return (got == n);
-}
-
-bool waitForHeader() {
-  static uint8_t state = 0;
-  while (Serial.available()) {
-    uint8_t b = (uint8_t)Serial.read();
-    if (state == 0)       state = (b == HEADER[0]) ? 1 : 0;
-    else if (state == 1)  state = (b == HEADER[1]) ? 2 : (b == HEADER[0] ? 1 : 0);
-    else if (state == 2)  state = (b == HEADER[2]) ? 3 : (b == HEADER[0] ? 1 : 0);
-    else {
-      if (b == HEADER[3]) { state = 0; return true; }
-      state = (b == HEADER[0]) ? 1 : 0;
-    }
-  }
-  return false;
-}
-
-void discardIncomingFrames() {
-  static uint8_t dump[FRAME_SIZE];
-  while (waitForHeader()) {
-    if (!readExact(dump, FRAME_SIZE, 5)) break;
-  }
-  while (Serial.available()) Serial.read();
-}
+const unsigned long CFG_SAVE_DELAY_MS = 1000;
 
 // ---------- Buttons ----------
 bool pressedEdge(bool current, bool &last) {
@@ -111,11 +76,11 @@ bool pressedEdge(bool current, bool &last) {
 // ---------- UI parameters ----------
 int case_selected = 0;
 
-// Saturation factor (x100): 0..200 => 0.00..2.00
+// Saturation factor (x100): 0..200
 int sat_x100   = 90;
-// Gamma (x100): 50..300 => 0.50..3.00
+// Gamma (x100): 50..300
 int gamma_x100 = 120;
-// Warm/Cool (x100): -50..+50 => -0.50..+0.50
+// Warm/Cool (x100): -50..+50
 int warm_x100  = 0;
 
 bool last_case = HIGH;
@@ -168,13 +133,9 @@ CRGB applyCorrectionsFast(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void showSolidOrange() {
-  // Nice warm orange (tweak if you want)
   fill_solid(leds, NUM_LEDS, CRGB(255, 80, 0));
   FastLED.show();
 }
-
-
-
 
 // ---------- UI LED mapping ----------
 int uiLevelForCase(int c) {
@@ -271,7 +232,6 @@ void factoryReset() {
   rebuildGammaLUT(gamma_x100);
   last_gamma_x100 = gamma_x100;
 
-  // Save immediately
   cfg.magic      = CFG_MAGIC;
   cfg.sat_x100   = (int16_t)sat_x100;
   cfg.gamma_x100 = (int16_t)gamma_x100;
@@ -279,7 +239,6 @@ void factoryReset() {
   cfg.thresh_sum = (int16_t)enable_thresh_sum;
   EEPROM.put(0, cfg);
 
-  // Quick confirmation blink
   analogWrite(UI_LED1, 200);
   analogWrite(UI_LED2, 200);
   analogWrite(UI_LED3, 200);
@@ -288,6 +247,110 @@ void factoryReset() {
 
   updateUiLeds();
 }
+
+/* ============================================================
+   Robust framed receiver
+   Packet = HEADER(4) + SEQ(1) + LEN(2 LE) + PAYLOAD(LEN) + CRC16(2 LE)
+   CRC16-CCITT computed over: SEQ + LEN + PAYLOAD
+   ============================================================ */
+
+static inline uint16_t crc16_ccitt_update(uint16_t crc, uint8_t data) {
+  crc ^= (uint16_t)data << 8;
+  for (uint8_t i = 0; i < 8; i++) {
+    if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+    else             crc = (crc << 1);
+  }
+  return crc;
+}
+
+bool readExact(uint8_t* buf, uint16_t n, uint16_t timeout_ms) {
+  uint16_t got = 0;
+  unsigned long start = millis();
+  while (got < n && (millis() - start) < timeout_ms) {
+    int avail = Serial.available();
+    while (avail-- > 0 && got < n) {
+      buf[got++] = (uint8_t)Serial.read();
+    }
+  }
+  return (got == n);
+}
+
+bool waitForHeader() {
+  static uint8_t state = 0;
+  while (Serial.available()) {
+    uint8_t b = (uint8_t)Serial.read();
+    if (state == 0)       state = (b == HEADER[0]) ? 1 : 0;
+    else if (state == 1)  state = (b == HEADER[1]) ? 2 : (b == HEADER[0] ? 1 : 0);
+    else if (state == 2)  state = (b == HEADER[2]) ? 3 : (b == HEADER[0] ? 1 : 0);
+    else {
+      if (b == HEADER[3]) { state = 0; return true; }
+      state = (b == HEADER[0]) ? 1 : 0;
+    }
+  }
+  return false;
+}
+
+void discardIncomingFrames() {
+  // Quick drain; used for ambient mode and “bad streak” recovery.
+  unsigned long start = millis();
+  while (Serial.available() && (millis() - start) < 10) Serial.read();
+}
+
+// Returns true only if a full valid packet is read (len matches + CRC ok).
+bool readPacket(uint8_t* payloadBuf) {
+  static uint8_t badStreak = 0;
+
+  if (!waitForHeader()) return false;
+
+  uint8_t meta[3];
+  if (!readExact(meta, 3, 40)) { // meta is tiny, but allow some slack
+    badStreak++;
+    if (badStreak >= 8) { discardIncomingFrames(); badStreak = 0; }
+    return false;
+  }
+
+  uint8_t seq = meta[0];
+  uint16_t len = (uint16_t)meta[1] | ((uint16_t)meta[2] << 8);
+
+  if (len != FRAME_SIZE) {
+    badStreak++;
+    if (badStreak >= 8) { discardIncomingFrames(); badStreak = 0; }
+    return false;
+  }
+
+  // Payload read: give this plenty of time so we don't time out mid-packet
+  if (!readExact(payloadBuf, len, 120)) {
+    badStreak++;
+    if (badStreak >= 8) { discardIncomingFrames(); badStreak = 0; }
+    return false;
+  }
+
+  uint8_t crcBytes[2];
+  if (!readExact(crcBytes, 2, 40)) {
+    badStreak++;
+    if (badStreak >= 8) { discardIncomingFrames(); badStreak = 0; }
+    return false;
+  }
+
+  uint16_t crc_rx = (uint16_t)crcBytes[0] | ((uint16_t)crcBytes[1] << 8);
+
+  uint16_t crc = 0xFFFF;
+  crc = crc16_ccitt_update(crc, seq);
+  crc = crc16_ccitt_update(crc, (uint8_t)(len & 0xFF));
+  crc = crc16_ccitt_update(crc, (uint8_t)(len >> 8));
+  for (uint16_t i = 0; i < len; i++) crc = crc16_ccitt_update(crc, payloadBuf[i]);
+
+  if (crc != crc_rx) {
+    badStreak++;
+    if (badStreak >= 8) { discardIncomingFrames(); badStreak = 0; }
+    return false;
+  }
+
+  badStreak = 0;
+  return true;
+}
+
+/* ============================================================ */
 
 void setup() {
   pinMode(BTN_CASE, INPUT_PULLUP);
@@ -315,7 +378,6 @@ void setup() {
   last_gamma_x100 = gamma_x100;
 
   updateUiLeds();
-  
 }
 
 void loop() {
@@ -360,7 +422,6 @@ void loop() {
     changed = true;
     markConfigDirty();
   }
-
   if (pressedEdge(b_down, last_down)) {
     stepDown();
     down_press_start_ms = now;
@@ -407,7 +468,6 @@ void loop() {
   }
 
   if (changed) updateUiLeds();
-
   saveConfigIfDue();
 
   // ---- Switch + pot brightness ----
@@ -420,47 +480,47 @@ void loop() {
   int raw = analogRead(POT_PIN);
   uint8_t target = map(raw, 0, 1023, 0, MAX_BRIGHTNESS);
 
-  // Ignore tiny 1-step changes (ADC noise) to prevent shimmer
   const uint8_t DEADBAND = 2;
-
   if (abs((int)target - (int)smooth) >= DEADBAND) {
-    // keep our existing smoothing feel
     smooth = (uint8_t)((smooth * 9 + target) / 10);
   }
-
   brightness = smooth;
 
-
   if (!switchOn) {
-    // Ambient mode: solid orange
-    FastLED.setBrightness(brightness); // still controlled by pot
-    discardIncomingFrames();           // keep serial clean
+    FastLED.setBrightness(brightness);
+    discardIncomingFrames();
     showSolidOrange();
     return;
   }
 
-
-
   FastLED.setBrightness(brightness);
 
-  // ---- Receive and display ----
-  if (waitForHeader()) {
-    static uint8_t buf[FRAME_SIZE];
+  // ---- Receive and display (LATEST ONLY) ----
+  static uint8_t buf[FRAME_SIZE];
+  static uint8_t latest[FRAME_SIZE];
+  bool got = false;
 
-    if (readExact(buf, FRAME_SIZE, 50)) {
-      for (int i = 0; i < NUM_LEDS; i++) {
-        uint8_t r = buf[3*i + 0];
-        uint8_t g = buf[3*i + 1];
-        uint8_t b = buf[3*i + 2];
-
-        uint16_t sum = (uint16_t)r + (uint16_t)g + (uint16_t)b;
-        if (sum <= (uint16_t)enable_thresh_sum) {
-          leds[i] = CRGB::Black;
-        } else {
-          leds[i] = applyCorrectionsFast(r, g, b);
-        }
-      }
-      FastLED.show();
+  // Drain backlog: keep newest valid packet only.
+  // Limit iterations so UI still runs.
+  for (uint8_t k = 0; k < 6; k++) {
+    if (readPacket(buf)) {
+      memcpy(latest, buf, FRAME_SIZE);
+      got = true;
+    } else {
+      break;
     }
+  }
+
+  if (got) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+      uint8_t r = latest[3*i + 0];
+      uint8_t g = latest[3*i + 1];
+      uint8_t b = latest[3*i + 2];
+
+      uint16_t sum = (uint16_t)r + (uint16_t)g + (uint16_t)b;
+      if (sum <= (uint16_t)enable_thresh_sum) leds[i] = CRGB::Black;
+      else leds[i] = applyCorrectionsFast(r, g, b);
+    }
+    FastLED.show();
   }
 }

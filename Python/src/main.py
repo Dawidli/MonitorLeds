@@ -15,17 +15,18 @@ try:
 except ImportError:
     import dxcam
 
-import sys
 
+# ========= LOGGING =========
 sys.stderr = open(r"C:\Users\dawid\PycharmProjects\MonitorLeds\led_error.log", "a", buffering=1)
 sys.stdout = sys.stderr
+# ===========================
+
 
 # ========= LED / LAYOUT CONFIG =========
 TOP_LEDS    = 51
 RIGHT_LEDS  = 22
 BOTTOM_LEDS = 51
 LEFT_LEDS   = 23
-
 NUM_LEDS = TOP_LEDS + RIGHT_LEDS + BOTTOM_LEDS + LEFT_LEDS
 TOP_BOTTOM_STRIP_HEIGHT = 40
 # ======================================
@@ -39,7 +40,7 @@ HEADER   = b"\xAA\x55\xAA\x55"
 
 
 # ========= SMOOTHING TUNING =========
-SMOOTHING_ALPHA = 0.9   # higher = smoother/slower
+SMOOTHING_ALPHA = 0.9
 # ====================================
 
 
@@ -48,19 +49,14 @@ FADE_IN_DURATION = 2.0
 # ===================================
 
 
-# ========= PYTHON FADE-OUT =========
-FADE_OUT_ENABLED   = True
-FADE_OUT_SECONDS   = 1.2
-BLACK_FRAME_HOLD_S = 0.15
-BLACK_THRESH_SUM   = 0  # 0 = only truly-black triggers fade
-# ===================================
+# ========= EXIT FADE-OUT ONLY =========
+EXIT_FADE_SECONDS = 1.2
+# =====================================
 
 
-# ========= STOP FLAG (set by STOP scheduled task) =========
-# STOP task should create this file on workstation lock:
-# powershell.exe -NoProfile -WindowStyle Hidden -Command "New-Item -Path 'C:\Users\dawid\PycharmProjects\MonitorLeds\stop.flag' -ItemType File -Force | Out-Null"
+# ========= STOP FLAG (lock event) =========
 STOP_FLAG_PATH = r"C:\Users\dawid\PycharmProjects\MonitorLeds\stop.flag"
-# =========================================================
+# =========================================
 
 
 @contextlib.contextmanager
@@ -73,14 +69,25 @@ def suppress_stderr():
         sys.stderr = old_stderr
 
 
+def crc16_ccitt(data: bytes, poly: int = 0x1021, init: int = 0xFFFF) -> int:
+    crc = init
+    for b in data:
+        crc ^= (b << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) & 0xFFFF) ^ poly
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
 def regions_top_bottom_vec(strip_img: np.ndarray, num_regions: int) -> np.ndarray:
     h, w, _ = strip_img.shape
     region_w = w // num_regions
     w_used = region_w * num_regions
     if w_used == 0:
         raise ValueError("region_w became 0; check screen width vs num_regions")
-    strip = strip_img[:, :w_used, :].astype(np.float32)
-    strip = strip.reshape(h, num_regions, region_w, 3)
+    strip = strip_img[:, :w_used, :].astype(np.float32).reshape(h, num_regions, region_w, 3)
     return strip.mean(axis=(0, 2))
 
 
@@ -90,21 +97,43 @@ def regions_left_right_vec(strip_img: np.ndarray, num_regions: int) -> np.ndarra
     h_used = region_h * num_regions
     if h_used == 0:
         raise ValueError("region_h became 0; check strip height vs num_regions")
-    strip = strip_img[:h_used, :, :].astype(np.float32)
-    strip = strip.reshape(num_regions, region_h, w, 3)
+    strip = strip_img[:h_used, :, :].astype(np.float32).reshape(num_regions, region_h, w, 3)
     return strip.mean(axis=(1, 2))
 
 
 def open_serial() -> Optional[serial.Serial]:
     try:
-        ser = serial.Serial(COM_PORT, BAUD, timeout=0, write_timeout=0.5)
+        ser = serial.Serial(
+            COM_PORT,
+            BAUD,
+            timeout=0,
+            write_timeout=None
+        )
+        try:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+        except Exception:
+            pass
         return ser
     except Exception as e:
         print(f"Warning: could not open serial port {COM_PORT}: {e}")
         return None
 
 
-def serial_worker(ser: Optional[serial.Serial], q: "queue.Queue[np.ndarray]"):
+def write_all(ser: serial.Serial, data: bytes) -> None:
+    mv = memoryview(data)
+    sent = 0
+    while sent < len(mv):
+        n = ser.write(mv[sent:])
+        if n is None:
+            n = 0
+        if n == 0:
+            time.sleep(0.001)
+            continue
+        sent += n
+
+
+def serial_worker(ser: Optional[serial.Serial], q: "queue.Queue[bytes]"):
     if ser is None:
         while True:
             item = q.get()
@@ -114,13 +143,11 @@ def serial_worker(ser: Optional[serial.Serial], q: "queue.Queue[np.ndarray]"):
 
     try:
         while True:
-            led_colors = q.get()
-            if led_colors is None:
+            frame_bytes = q.get()
+            if frame_bytes is None:
                 break
-
-            frame = HEADER + led_colors.tobytes()
             try:
-                ser.write(frame)
+                write_all(ser, frame_bytes)
             except Exception as e:
                 print(f"Serial write error: {e}")
     finally:
@@ -131,34 +158,25 @@ def serial_worker(ser: Optional[serial.Serial], q: "queue.Queue[np.ndarray]"):
             pass
 
 
-def put_latest(q: "queue.Queue[np.ndarray]", frame: np.ndarray):
+def put_latest(q: "queue.Queue[bytes]", frame_bytes: bytes):
     try:
-        q.put_nowait(frame)
+        q.put_nowait(frame_bytes)
     except queue.Full:
         try:
             _ = q.get_nowait()
         except queue.Empty:
             pass
         try:
-            q.put_nowait(frame)
+            q.put_nowait(frame_bytes)
         except queue.Full:
             pass
 
 
-def fade_to_black(q: "queue.Queue[np.ndarray]", last_sent: np.ndarray, duration_s: float, fps: float = 60.0):
-    if duration_s <= 0:
-        put_latest(q, np.zeros_like(last_sent))
-        return
-
-    steps = max(1, int(duration_s * fps))
-    base = last_sent.astype(np.float32)
-
-    for i in range(steps + 1):
-        t = i / steps
-        factor = 1.0 - t
-        frame = (base * factor).astype(np.uint8)
-        put_latest(q, frame)
-        time.sleep(1.0 / fps)
+def stop_flag_is_set() -> bool:
+    try:
+        return os.path.exists(STOP_FLAG_PATH)
+    except Exception:
+        return False
 
 
 def clear_stop_flag():
@@ -169,25 +187,44 @@ def clear_stop_flag():
         pass
 
 
-def stop_flag_is_set() -> bool:
-    try:
-        return os.path.exists(STOP_FLAG_PATH)
-    except Exception:
-        return False
+def build_packet(payload: bytes, seq: int) -> bytes:
+    ln = len(payload)
+    meta = bytes([seq & 0xFF]) + ln.to_bytes(2, "little")
+    crc = crc16_ccitt(meta + payload).to_bytes(2, "little")
+    return HEADER + meta + payload + crc
+
+
+def send_frame(serial_queue: "queue.Queue[bytes]", frame_u8: np.ndarray, seq: int) -> int:
+    pkt = build_packet(frame_u8.tobytes(), seq)
+    put_latest(serial_queue, pkt)
+    return (seq + 1) & 0xFF
+
+
+def fade_to_black(serial_queue: "queue.Queue[bytes]", last_sent: np.ndarray, seconds: float, seq: int, fps: float = 60.0) -> int:
+    steps = max(1, int(seconds * fps))
+    base = last_sent.astype(np.float32)
+
+    for i in range(steps + 1):
+        t = i / steps
+        factor = 1.0 - t
+        frame = (base * factor).astype(np.uint8)
+        seq = send_frame(serial_queue, frame, seq)
+        time.sleep(1.0 / fps)
+
+    return seq
 
 
 def main():
-    # If a previous lock left the flag behind, don't instantly exit on startup.
     clear_stop_flag()
 
     with suppress_stderr():
         camera = dxcam.create(output_color="RGB")
 
-    camera.start(target_fps=120, video_mode=True)
+    # Reduce capture pressure/jitter
+    camera.start(target_fps=60, video_mode=True)
 
     ser = open_serial()
-    serial_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=1)
-
+    serial_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=1)
     worker = threading.Thread(target=serial_worker, args=(ser, serial_queue), daemon=True)
     worker.start()
 
@@ -203,21 +240,16 @@ def main():
 
     start_time = time.perf_counter()
 
-    MAX_SEND_FPS = 60.0
+    # Send cap (this matters)
+    MAX_SEND_FPS = 45.0
     min_send_dt  = 1.0 / MAX_SEND_FPS
     last_send_t  = 0.0
 
-    last_sent    = np.zeros((NUM_LEDS, 3), dtype=np.uint8)
-    black_since  = None
-    fade_mode    = False
-    fade_start_t = 0.0
-    fade_base    = np.zeros((NUM_LEDS, 3), dtype=np.float32)
+    last_sent = np.zeros((NUM_LEDS, 3), dtype=np.uint8)
+    seq = 0
 
     try:
         while True:
-            # --- Graceful stop request from STOP scheduled task ---
-            # STOP task creates STOP_FLAG_PATH on workstation lock.
-            # We detect it, clear it, and exit via finally -> fade-out runs.
             if stop_flag_is_set():
                 clear_stop_flag()
                 break
@@ -265,12 +297,9 @@ def main():
             left_means   = regions_left_right_vec(left_img, LEFT_LEDS)
 
             idx = 0
-            led_float[idx:idx + TOP_LEDS] = top_means
-            idx += TOP_LEDS
-            led_float[idx:idx + RIGHT_LEDS] = right_means
-            idx += RIGHT_LEDS
-            led_float[idx:idx + BOTTOM_LEDS] = bottom_means[::-1]
-            idx += BOTTOM_LEDS
+            led_float[idx:idx + TOP_LEDS] = top_means; idx += TOP_LEDS
+            led_float[idx:idx + RIGHT_LEDS] = right_means; idx += RIGHT_LEDS
+            led_float[idx:idx + BOTTOM_LEDS] = bottom_means[::-1]; idx += BOTTOM_LEDS
             led_float[idx:idx + LEFT_LEDS] = left_means[::-1]
 
             if not have_smoothed:
@@ -284,50 +313,20 @@ def main():
 
             led_colors[:] = np.clip(smoothed_led_float, 0, 255).astype(np.uint8)
 
-            # Fade-in
+            # Fade-in (startup only)
             elapsed = time.perf_counter() - start_time
             if elapsed < FADE_IN_DURATION:
                 t = elapsed / FADE_IN_DURATION
                 fade_in_factor = t * t
-            else:
-                fade_in_factor = 1.0
-
-            if fade_in_factor < 1.0:
                 to_send = (led_colors.astype(np.float32) * fade_in_factor).astype(np.uint8)
             else:
                 to_send = led_colors
 
             now_t = time.perf_counter()
-
-            frame_sum = int(to_send.sum())
-            is_black = frame_sum <= BLACK_THRESH_SUM
-
-            if FADE_OUT_ENABLED:
-                if is_black:
-                    if black_since is None:
-                        black_since = now_t
-                    if (not fade_mode) and (now_t - black_since >= BLACK_FRAME_HOLD_S):
-                        fade_mode = True
-                        fade_start_t = now_t
-                        fade_base = last_sent.astype(np.float32)
-                else:
-                    black_since = None
-                    fade_mode = False
-
-            if fade_mode:
-                t = (now_t - fade_start_t) / max(FADE_OUT_SECONDS, 1e-6)
-                if t >= 1.0:
-                    send_frame = np.zeros((NUM_LEDS, 3), dtype=np.uint8)
-                else:
-                    factor = 1.0 - t
-                    send_frame = (fade_base * factor).astype(np.uint8)
-            else:
-                send_frame = to_send
-
             if (now_t - last_send_t) >= min_send_dt:
                 last_send_t = now_t
-                last_sent = send_frame.copy()
-                put_latest(serial_queue, last_sent)
+                last_sent = to_send.copy()
+                seq = send_frame(serial_queue, last_sent, seq)
 
     except KeyboardInterrupt:
         print("\nStopped by user.")
@@ -337,13 +336,12 @@ def main():
         except Exception:
             pass
 
-        # Your exit fade-out (this runs on Ctrl+C, PyCharm stop, OR stop.flag)
-        if FADE_OUT_ENABLED:
-            fade_to_black(serial_queue, last_sent, duration_s=FADE_OUT_SECONDS, fps=60.0)
+        # Exit fade only (clean + deterministic)
+        seq = fade_to_black(serial_queue, last_sent, EXIT_FADE_SECONDS, seq, fps=60.0)
 
         off = np.zeros((NUM_LEDS, 3), dtype=np.uint8)
         for _ in range(8):
-            put_latest(serial_queue, off)
+            seq = send_frame(serial_queue, off, seq)
             time.sleep(0.01)
 
         serial_queue.put(None)
