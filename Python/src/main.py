@@ -4,6 +4,7 @@ import io
 import contextlib
 import threading
 import queue
+import os
 from typing import Optional
 
 import numpy as np
@@ -14,6 +15,10 @@ try:
 except ImportError:
     import dxcam
 
+import sys
+
+sys.stderr = open(r"C:\Users\dawid\PycharmProjects\MonitorLeds\led_error.log", "a", buffering=1)
+sys.stdout = sys.stderr
 
 # ========= LED / LAYOUT CONFIG =========
 TOP_LEDS    = 51
@@ -49,6 +54,13 @@ FADE_OUT_SECONDS   = 1.2
 BLACK_FRAME_HOLD_S = 0.15
 BLACK_THRESH_SUM   = 0  # 0 = only truly-black triggers fade
 # ===================================
+
+
+# ========= STOP FLAG (set by STOP scheduled task) =========
+# STOP task should create this file on workstation lock:
+# powershell.exe -NoProfile -WindowStyle Hidden -Command "New-Item -Path 'C:\Users\dawid\PycharmProjects\MonitorLeds\stop.flag' -ItemType File -Force | Out-Null"
+STOP_FLAG_PATH = r"C:\Users\dawid\PycharmProjects\MonitorLeds\stop.flag"
+# =========================================================
 
 
 @contextlib.contextmanager
@@ -109,7 +121,6 @@ def serial_worker(ser: Optional[serial.Serial], q: "queue.Queue[np.ndarray]"):
             frame = HEADER + led_colors.tobytes()
             try:
                 ser.write(frame)
-                #ser.flush()
             except Exception as e:
                 print(f"Serial write error: {e}")
     finally:
@@ -122,9 +133,6 @@ def serial_worker(ser: Optional[serial.Serial], q: "queue.Queue[np.ndarray]"):
 
 def put_latest(q: "queue.Queue[np.ndarray]", frame: np.ndarray):
     try:
-
-
-
         q.put_nowait(frame)
     except queue.Full:
         try:
@@ -153,7 +161,25 @@ def fade_to_black(q: "queue.Queue[np.ndarray]", last_sent: np.ndarray, duration_
         time.sleep(1.0 / fps)
 
 
+def clear_stop_flag():
+    try:
+        if os.path.exists(STOP_FLAG_PATH):
+            os.remove(STOP_FLAG_PATH)
+    except Exception:
+        pass
+
+
+def stop_flag_is_set() -> bool:
+    try:
+        return os.path.exists(STOP_FLAG_PATH)
+    except Exception:
+        return False
+
+
 def main():
+    # If a previous lock left the flag behind, don't instantly exit on startup.
+    clear_stop_flag()
+
     with suppress_stderr():
         camera = dxcam.create(output_color="RGB")
 
@@ -189,6 +215,13 @@ def main():
 
     try:
         while True:
+            # --- Graceful stop request from STOP scheduled task ---
+            # STOP task creates STOP_FLAG_PATH on workstation lock.
+            # We detect it, clear it, and exit via finally -> fade-out runs.
+            if stop_flag_is_set():
+                clear_stop_flag()
+                break
+
             frame = camera.get_latest_frame()
             if frame is None:
                 continue
@@ -249,7 +282,6 @@ def main():
                     + (1.0 - SMOOTHING_ALPHA) * led_float
                 )
 
-            # Convert to uint8 RGB (no corrections here; Arduino will do it)
             led_colors[:] = np.clip(smoothed_led_float, 0, 255).astype(np.uint8)
 
             # Fade-in
@@ -300,8 +332,12 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
-        camera.stop()
+        try:
+            camera.stop()
+        except Exception:
+            pass
 
+        # Your exit fade-out (this runs on Ctrl+C, PyCharm stop, OR stop.flag)
         if FADE_OUT_ENABLED:
             fade_to_black(serial_queue, last_sent, duration_s=FADE_OUT_SECONDS, fps=60.0)
 
